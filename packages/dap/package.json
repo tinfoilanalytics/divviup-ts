@@ -21,10 +21,12 @@
     "test:coverage": "c8 npm test"
   },
   "dependencies": {
+    "@dajiaji/bhttp": "npm:@jsr/dajiaji__bhttp@^0.3.5",
     "@divviup/common": "^0.2.2",
     "@divviup/prio3": "^0.8.0",
     "@divviup/vdaf": "^0.8.0",
-    "hpke-js": "^1.6.1"
+    "hpke-js": "^1.6.1",
+    "oblivious-http": "^0.1.0"
   },
   "devDependencies": {
     "@hpke/chacha20poly1305": "^1.5.0",

@@ -20,6 +20,22 @@ import {
   Prio3SumVec,
 } from "@divviup/prio3";
 import { randomBytes } from "@divviup/common";
+import { DapOhttpClient } from './ohttp.js';
+import type { OhttpConfig } from './ohttp.js';
+
+
+export interface OhttpTaskOptions {
+  ohttpConfig?: OhttpConfig & {
+    /**
+     * Custom retry configuration for OHTTP operations
+     */
+    retryConfig?: {
+      maxAttempts?: number;
+      backoffMs?: number;
+      maxBackoffMs?: number;
+    };
+  };
+}
 
 export { TaskId } from "./taskId.js";
 
@@ -114,6 +130,7 @@ export class Task<
   #extensions: Extension[] = [];
   #fetch: Fetch = globalThis.fetch.bind(globalThis);
   #hpkeConfigsWereInvalid = false;
+  #ohttpClient?: DapOhttpClient;
 
   /** the protocol version for this task, usually in the form `dap-{nn}` */
   static readonly protocolVersion = DAP_VERSION;
@@ -121,7 +138,7 @@ export class Task<
   /**
      Builds a new Task from the {@linkcode ClientParameters} provided. 
    */
-  constructor(parameters: ClientParameters & Spec) {
+  constructor(parameters: ClientParameters & Spec & { ohttpConfig?: OhttpConfig }) {
     this.#vdaf = vdafFromSpec(parameters) as ClientVdaf<Measurement>;
     this.#id = idFromDefinition(parameters.id);
     this.#leader = Aggregator.leader(parameters.leader);
@@ -130,6 +147,31 @@ export class Task<
       throw new Error("timePrecisionSeconds must be a number");
     }
     this.#timePrecisionSeconds = parameters.timePrecisionSeconds;
+    if (parameters.ohttpConfig) {
+      this.#ohttpClient = new DapOhttpClient(parameters.ohttpConfig);
+    }
+  }
+
+  /**
+   * Updates the OHTTP key configuration with new data.
+   * This can be used to update the key config without making a network request.
+   */
+  async updateOhttpKeyConfig(keyConfigData: Uint8Array): Promise<void> {
+    if (!this.#ohttpClient) {
+      throw new Error("Task is not configured for OHTTP");
+    }
+    await this.#ohttpClient.updateKeyConfig(keyConfigData);
+  }
+
+  /**
+   * Forces a refresh of the OHTTP key configuration by fetching from the server.
+   * Only works if the task was initialized with a keyConfigs URL.
+   */
+  async refreshOhttpKeyConfig(): Promise<void> {
+    if (!this.#ohttpClient) {
+      throw new Error("Task is not configured for OHTTP");
+    }
+    await this.#ohttpClient.refreshKeyConfig();
   }
 
   /** @internal */
@@ -205,23 +247,47 @@ export class Task<
 
      @throws {@linkcode DAPError} if the response is not Ok.
    */
-  async sendReport(report: Report) {
+  async sendReport(report: Report): Promise<void> {
     const body = report.encode();
     const leader = this.#leader;
     const id = this.#id.toString();
-    const response = await this.#fetch(
-      new URL(`tasks/${id}/reports`, leader.url).toString(),
-      {
-        method: "PUT",
-        headers: { "Content-Type": CONTENT_TYPES.REPORT },
-        body,
-      },
-    );
+    const url = new URL(`tasks/${id}/reports`, leader.url);
+    const headers = new Map([["Content-Type", CONTENT_TYPES.REPORT]]);
 
-    if (!response.ok) {
-      throw await DAPError.fromResponse(response, "report upload failed");
+    try {
+      if (this.#ohttpClient) {
+        const response = await this.#ohttpClient.relayRequest(
+          "PUT",
+          url,
+          headers,
+          body
+        );
+
+        if (!response.ok) {
+          throw await DAPError.fromResponse(response, "report upload failed");
+        }
+      } else {
+        const response = await fetch(url.toString(), {
+          method: "PUT",
+          headers: { "Content-Type": CONTENT_TYPES.REPORT },
+          body,
+        });
+
+        if (!response.ok) {
+          throw await DAPError.fromResponse(response, "report upload failed");
+        }
+      }
+    } catch (error) {
+      if (error instanceof DAPError &&
+        error.type === "urn:ietf:params:ppm:dap:error:outdatedConfig" &&
+        this.#ohttpClient) {
+        await this.#ohttpClient.refreshKeyConfig();
+        return this.sendReport(report);
+      }
+      throw error;
     }
   }
+
 
   private hasKeyConfiguration(): boolean {
     return !!this.#leader.hpkeConfigList && !!this.#helper.hpkeConfigList;
